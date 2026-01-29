@@ -120,32 +120,124 @@ func main() {
 }
 
 func handleConnection(nConn net.Conn, config *ssh.ServerConfig) {
-	conn, chans, reqs, err := ssh.NewServerConn(nConn, config)
+	// 1. Handshake with Client
+	clientConn, clientChans, clientReqs, err := ssh.NewServerConn(nConn, config)
 	if err != nil {
 		log.Printf("handshake failed: %v", err)
 		return
 	}
-	defer conn.Close()
+	defer clientConn.Close()
 
-	log.Printf("Logged in: %s (x509: %s)", conn.User(), conn.Permissions.Extensions["x509-serial"])
+	log.Printf("Logged in: %s (x509: %s)", clientConn.User(), clientConn.Permissions.Extensions["x509-serial"])
 
-	go ssh.DiscardRequests(reqs)
-
-	for newChannel := range chans {
-		if newChannel.ChannelType() != "session" {
-			newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
-			continue
-		}
-
-		channel, requests, err := newChannel.Accept()
-		if err != nil {
-			log.Printf("Could not accept channel: %v", err)
-			return
-		}
-
-		// Forward the session to the backend
-		handleSession(channel, requests, conn)
+	// 2. Connect to Backend (The "Real" SSH Server)
+	// Replace with your actual backend logic/key
+	backendKey, _ := os.ReadFile("/home/ubuntu/.ssh/id_ed25519") // Usually a dedicated proxy identity key
+	backendSigner, _ := ssh.ParsePrivateKey(backendKey)
+	backendConfig := &ssh.ClientConfig{
+		User:            "ubuntu", // Forward the username requested by client
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(backendSigner)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
+	backendConn, err := ssh.Dial("tcp", "127.0.0.1:22", backendConfig)
+	if err != nil {
+		log.Printf("backend dial failed: %v", err)
+		return
+	}
+	defer backendConn.Close()
+
+	// 3. HANDLE GLOBAL REQUESTS (Enables -R / Remote Forwarding)
+	// Forwards 'tcpip-forward' and 'cancel-tcpip-forward' to the backend
+	go func() {
+		for req := range clientReqs {
+			ok, payload, err := backendConn.SendRequest(req.Type, req.WantReply, req.Payload)
+			if err != nil {
+				log.Printf("error forwarding global request: %v", err)
+				continue
+			}
+			if req.WantReply {
+				req.Reply(ok, payload)
+			}
+		}
+	}()
+
+	// 4. HANDLE CHANNELS INITIATED BY BACKEND (Enables -R data flow)
+	// catching 'forwarded-tcpip' channels coming back from the real server
+	backendChans := backendConn.HandleChannelOpen("forwarded-tcpip")
+	go func() {
+		for newChannel := range backendChans {
+			// Proxy the channel opening back to the client
+			clientChan, clientReqs, err := clientConn.OpenChannel("forwarded-tcpip", newChannel.ExtraData())
+			if err != nil {
+				newChannel.Reject(ssh.ConnectionFailed, "client refused reverse tunnel")
+				continue
+			}
+			backendChan, backendReqs, err := newChannel.Accept()
+			if err != nil {
+				clientChan.Close()
+				continue
+			}
+			go bridge(clientChan, clientReqs, backendChan, backendReqs)
+		}
+	}()
+
+	// 5. HANDLE CHANNELS INITIATED BY CLIENT (Enables -L and Sessions)
+	for newChannel := range clientChans {
+		switch newChannel.ChannelType() {
+		case "session":
+			// Standard interactive terminal/shell
+			bc, br, err := backendConn.OpenChannel("session", nil)
+			if err != nil {
+				newChannel.Reject(ssh.ConnectionFailed, "backend session failed")
+				continue
+			}
+			c, r, _ := newChannel.Accept()
+			go bridge(c, r, bc, br)
+
+		case "direct-tcpip":
+			// Local Port Forwarding (-L)
+			// Client opens a port locally; Proxy forwards it to Backend
+			bc, br, err := backendConn.OpenChannel("direct-tcpip", newChannel.ExtraData())
+			if err != nil {
+				newChannel.Reject(ssh.ConnectionFailed, "backend dial failed")
+				continue
+			}
+			c, r, _ := newChannel.Accept()
+			go bridge(c, r, bc, br)
+
+		default:
+			newChannel.Reject(ssh.UnknownChannelType, "unsupported channel type")
+		}
+	}
+}
+
+func bridge(c ssh.Channel, cr <-chan *ssh.Request, bc ssh.Channel, br <-chan *ssh.Request) {
+	defer c.Close()
+	defer bc.Close()
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Forward requests (e.g., window-change for sessions)
+	go func() {
+		for r := range cr {
+			ok, _ := bc.SendRequest(r.Type, r.WantReply, r.Payload)
+			if r.WantReply {
+				r.Reply(ok, nil)
+			}
+		}
+	}()
+	go func() {
+		for r := range br {
+			ok, _ := c.SendRequest(r.Type, r.WantReply, r.Payload)
+			if r.WantReply {
+				r.Reply(ok, nil)
+			}
+		}
+	}()
+
+	go func() { io.Copy(c, bc); wg.Done() }()
+	go func() { io.Copy(bc, c); wg.Done() }()
+	wg.Wait()
 }
 
 func handleSession(clientChannel ssh.Channel, clientRequests <-chan *ssh.Request, clientConn *ssh.ServerConn) {
